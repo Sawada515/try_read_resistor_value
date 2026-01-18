@@ -37,7 +37,7 @@ class BackGroundStats:
 @dataclass
 class DetectBand:
     x: int
-    y: int
+    band_width: int
     mean_color_lab: Tuple[float, float, float]
     ssd_score: float
 
@@ -84,6 +84,9 @@ MIN_SPLIT_SEGMENT: int = 5
 GLARE_MAX_SOFT: float = 0.15
 
 AB_VALIANCE_CLIP = 800.0
+
+SN_RATIO_LOW: float = 3.0
+SN_RATIO_HIGH: float = 10.0
 
 def main():
     save_dir = Path(IMG_OUTPUT_DIR)
@@ -154,6 +157,8 @@ def main():
             print(r_b)
         print("band_result finish")
 
+        points = [(x.x) for x in result_bands]
+
         l_segment_u8 = (lab_segment[:, :, 0] * (255.0 / 100.0)).astype(np.uint8)
         a_segment_u8 = (lab_segment[:, :, 1] + 128.0).astype(np.uint8)
         b_segment_u8 = (lab_segment[:, :, 2] + 128.0).astype(np.uint8)
@@ -166,6 +171,14 @@ def main():
 
         lab_one_line_u8 = cv2.merge([l_one_line_u8, a_one_line_u8, b_one_line_u8])
 
+        debug_add_points = lab_one_line_u8.copy()
+        debug_add_points = cv2.cvtColor(debug_add_points, cv2.COLOR_LAB2BGR)
+
+        debug_add_points = cv2.resize(debug_add_points, (w, h // 2), interpolation=cv2.INTER_NEAREST)
+
+        for p in points:
+            cv2.circle(debug_add_points, (p, h // 4), 2, (255, 0, 0), -1)
+
         lab_one_line_u8 = cv2.resize(lab_one_line_u8, (w, 2), interpolation=cv2.INTER_NEAREST)
 
         l_resistor_back_ground_u8 = np.clip(back_ground_stats.color_lab[0] * (255.0 / 100.0), 0, 255).astype(np.uint8)
@@ -176,6 +189,7 @@ def main():
         lab_resistor_back_ground_u8 = np.array([[[l_resistor_back_ground_u8, a_resistor_back_ground_u8, b_resistor_back_ground_u8]]], dtype=np.uint8)
 
         lab_resistor_back_ground_u8 = cv2.resize(lab_resistor_back_ground_u8, (w, 2), interpolation=cv2.INTER_NEAREST)
+
 
         debug_img = []
 
@@ -197,9 +211,12 @@ def main():
 
         debug_img.append(cv2.cvtColor(lab_resistor_back_ground_u8, cv2.COLOR_LAB2BGR))
 
+        debug_img.append(debug_add_points)
+
         debug_imgs = cv2.vconcat(debug_img)
 
         debug_imgs = cv2.resize(debug_imgs, None, fx=5, fy=5, interpolation=cv2.INTER_NEAREST)
+
 
         save_name = file.name
         save_path =  save_dir / save_name
@@ -648,9 +665,21 @@ def detect_bands(
     #SSD
     pixel_ab = pixels[:, 1:]
     back_ground_ab = np.array(back_ground_stats.color_lab[1:])
+
+    diff_sq_ab = np.sum((pixel_ab - back_ground_ab)**2, axis=1)
+
+    back_ground_l = back_ground_stats.color_lab[0]
+    pixel_l = pixels[:, 0]
+
+    delta_l = back_ground_l - pixel_l
+
+    diff_l_dark = np.maximum(0, delta_l)
+
+    diff_l_bright = np.minimum(np.maximum(0, -delta_l), 30.0)
+
+    diff_sq_total = diff_sq_ab + (1.0 * diff_l_dark) ** 2 + (0.8 * diff_l_bright) ** 2
         
-    diff_sq = np.sum((pixel_ab - back_ground_ab)**2, axis=1)
-    ssd_signal = np.sqrt(diff_sq)
+    ssd_signal = np.sqrt(diff_sq_total)
 
     #scale
     ssd_pre_smooth = gaussian_filter1d(ssd_signal, sigma=1.0)
@@ -695,7 +724,7 @@ def detect_bands(
     peaks_a, props_a = find_peaks(signal_a, height=noise_floor, prominence=noise_floor * 0.5, distance=sg_window_len * 0.6)
 
     #形状ピーク Derivative Zero-Crossing
-    deriv_window = int(sg_window_len * 1.5) | 1
+    deriv_window = sg_window_len
     signal_b_deriv = savgol_filter(signal_smooth, window_length=deriv_window, polyorder=2, deriv=1)
 
     #print(f"debug signal_b_deriv = {signal_b_deriv}")
@@ -707,9 +736,8 @@ def detect_bands(
     if deriv_mad < 1e-6:
         #0.6745 正規分布換算
         deriv_mad = np.std(signal_b_deriv) * 0.6745
-    
-    slope_epsilon = deriv_mad * 1.0
-    #print(f"debug : slope_epsilon = {slope_epsilon}")
+
+    slope_epsilon = 0.01
 
     zero_crossings_b = []
 
@@ -739,6 +767,7 @@ def detect_bands(
     for i, x_a in enumerate(peaks_a):
         #print("debug info : code[for i, x_a in enumerate(peaks_a):]")
         #print(f"debug zero_crossings_b = {zero_crossings_b}")
+
         valid_b = False
 
         x_left = left_ips[i]
