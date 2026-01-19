@@ -157,7 +157,9 @@ def main():
             print(r_b)
         print("band_result finish")
 
-        points = [(x.x) for x in result_bands]
+        correction_result_bands = refine_band_candidates(result_bands, clipped_roi.shape[1] // h)
+
+        points = [(x.x) for x in correction_result_bands]
 
         l_segment_u8 = (lab_segment[:, :, 0] * (255.0 / 100.0)).astype(np.uint8)
         a_segment_u8 = (lab_segment[:, :, 1] + 128.0).astype(np.uint8)
@@ -814,6 +816,81 @@ def detect_bands(
     }
 
     return result_bands, debug_data
+
+def refine_band_candidates(
+    bands: List[DetectBand],
+    roi_width: int
+) -> List[DetectBand]:
+    
+    count = len(bands)
+
+    if count == 0:
+        return []
+    
+    bands.sort(key=lambda b: b.x)
+
+    if count == 1:
+        band = bands[0]
+
+        TOLERANCE: float = 0.15
+
+        margin = roi_width * TOLERANCE
+        if abs(band.x - roi_width / 2) < margin:
+            return [band]
+        else:
+            return []
+    if count == 2:
+        return []
+    
+    merged_bands = []
+    
+    current_band = bands[0]
+    
+    for i in range(1, count):
+        next_band = bands[i]
+
+        dist = next_band.x - current_band.x
+        
+        collision_thresh = max(current_band.band_width, next_band.band_width) * 0.8
+
+        if dist < collision_thresh:
+            if next_band.ssd_score > current_band.ssd_score:
+                current_band = next_band
+        else:
+            merged_bands.append(current_band)
+
+            current_band = next_band
+
+    merged_bands.append(current_band)
+
+    if len(merged_bands) < 3:
+        return []
+
+    x_coords = np.array([b.x for b in merged_bands])
+    diffs = np.diff(x_coords)
+
+    median_pitch = np.median(diffs)
+
+    avg_width = np.mean([b.band_width for b in merged_bands])
+    if median_pitch < avg_width:
+        print("too low confidence")
+    
+    result_bands = [merged_bands[0]]
+    last_x = merged_bands[0].x
+
+    for i in range(1, len(merged_bands)):
+        band = merged_bands[i]
+        dist = band.x - last_x
+
+        ratio = dist / median_pitch
+
+        if 0.5 <= ratio <= 2.8:
+            result_bands.append(band)
+            last_x = band.x
+        else:
+            print(f"remove x={band.x}")
+    
+    return result_bands
 
 
 if __name__ == "__main__":
