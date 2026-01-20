@@ -41,14 +41,15 @@ class DetectBand:
     mean_color_lab: Tuple[float, float, float]
     ssd_score: float
 
-IMG_INPUT_DIR:str = "../output_resistors"
+IMG_INPUT_DIR:str = "./output_resistors"
 IMG_OUTPUT_DIR:str = "./result"
 
 #定数
 MIN_EXPECTED_ASPECT_AFTER_ALIGNMENT:float = 2.5
 
 # ヒストグラムのピーク(ボディの明るさ)から、どれくらい離れればグレアとみなすか
-L_PEAK_MARGIN: float = 20.0  
+#L_PEAK_MARGIN: float = 20.0  
+L_PEAK_MARGIN: float = 10.0  
 # どんなに暗い画像でも、このL値を下回るものはグレアと判定しない（絶対下限）
 L_ABSOLUTE_MIN: float = 50.0 
 
@@ -71,10 +72,11 @@ MORPH_KERNEL_MIN_PX: int = 3
 # 最終的な候補領域内の最大輝度が、全体の上位0.5%輝度の何割以上か
 L_CHECK_RATIO: float = 0.90
 # 最終チェック時の絶対下限輝度
-L_CHECK_MIN: float = 80.0
+#L_CHECK_MIN: float = 70.0
+L_CHECK_MIN: float = 50.0
 
 #分割したセグメントの重み 中央のセグメントほど優先
-Y_CENTER_WEIGHTS = {0: 0.6, 1: 0.9, 2: 1.0, 3: 0.9, 4: 0.6}
+Y_CENTER_WEIGHTS = {0: 0.7, 1: 0.85, 2: 1.0, 3: 0.85, 4: 0.7}
 
 #ab分散閾値
 AB_VARIANCE_MIN_SAFE: float = 100.0
@@ -117,7 +119,6 @@ def main():
         if ret == False:
             continue
         
-        # 2. ROIクリッピング (5%カット)
         clipped_roi = clip_resistor_roi(cast(NDArray[np.uint8], img))
         if clipped_roi is None:
             continue
@@ -157,7 +158,7 @@ def main():
             print(r_b)
         print("band_result finish")
 
-        correction_result_bands = refine_band_candidates(result_bands, clipped_roi.shape[1] // h)
+        correction_result_bands = refine_band_candidates(result_bands, w)
 
         points = [(x.x) for x in correction_result_bands]
 
@@ -192,14 +193,9 @@ def main():
 
         lab_resistor_back_ground_u8 = cv2.resize(lab_resistor_back_ground_u8, (w, 2), interpolation=cv2.INTER_NEAREST)
 
-
         debug_img = []
 
         debug_img.append(clipped_roi)
-        
-        debug_img.append(cv2.cvtColor(l, cv2.COLOR_GRAY2BGR))
-        debug_img.append(cv2.cvtColor(a, cv2.COLOR_GRAY2BGR))
-        debug_img.append(cv2.cvtColor(b, cv2.COLOR_GRAY2BGR))
 
         debug_img.append(cv2.cvtColor(specular_mask, cv2.COLOR_GRAY2BGR))
 
@@ -289,7 +285,7 @@ def clip_resistor_roi(roi: NDArray[np.uint8] | None) -> NDArray[np.uint8] | None
 
     h, w = roi.shape[:2]
 
-    trim_w = int(w * 0.05)
+    trim_w = int(w * 0.01)
     trim_h = int(h * 0.05)
 
     return roi[trim_h : h-trim_h, trim_w : w-trim_w]
@@ -307,21 +303,21 @@ def estimate_glare_l_threshold_peak(l_roi: NDArray[np.float32]) -> float:
     
     base_threshold = peak_l_value + L_PEAK_MARGIN
     
-    p99 = float(np.percentile(l_roi, 99.0))
+    p90 = float(np.percentile(l_roi, 90.0))
 
     tmp_l_threshold = max(base_threshold, L_ABSOLUTE_MIN)
 
-    return min(tmp_l_threshold, p99)
+    return min(tmp_l_threshold, p90)
 
 def get_adaptive_white_point(
     a_roi: NDArray[np.float32],
     b_roi: NDArray[np.float32],
     s_roi: NDArray[np.float32]
 ) -> Tuple[float, float]:
-    low_s_mask = s_roi < 0.2
+    low_s_mask = s_roi < 0.25
     
     if np.count_nonzero(low_s_mask) < 10:
-        return 0.0, 0.0
+        return 128.0, 128.0
     
     a_reference = float(np.median(a_roi[low_s_mask]))
     b_reference = float(np.median(b_roi[low_s_mask]))
@@ -348,6 +344,8 @@ def create_specular_mask(
 
     h, w = roi_f.shape[:2]
 
+    roi_f = cv2.bilateralFilter(roi_f, d=5, sigmaColor=50, sigmaSpace=50)
+
     hsv_f = cv2.cvtColor(roi_f, cv2.COLOR_BGR2HSV)
     lab_f = cv2.cvtColor(roi_f, cv2.COLOR_BGR2LAB)
 
@@ -357,7 +355,7 @@ def create_specular_mask(
     a_roi = cast(NDArray[np.float32], lab_f[:, :, 1])
     b_roi = cast(NDArray[np.float32], lab_f[:, :, 2])
 
-    s_threshold = S_THRESHOLD_MAX
+    s_threshold = min(S_THRESHOLD_MAX, np.percentile(s_roi, 20.0))
 
     l_threshold = estimate_glare_l_threshold_peak(l_roi)
 
@@ -391,20 +389,20 @@ def create_specular_mask(
 
     roi_area = float(h * w)
 
-    p99_5 = float(np.percentile(l_roi, 99.5))
-    glare_peak_floor = max(p99_5 * L_CHECK_RATIO, L_CHECK_MIN)
+    p99 = float(np.percentile(l_roi, 99.0))
+    glare_peak_floor = max(p99 * L_CHECK_RATIO, L_CHECK_MIN)
 
     for contrast in contours:
         x, y, contrast_w, contrast_h = cv2.boundingRect(contrast)
 
-        if (float(contrast_w * contrast_h)) < (roi_area * 0.001):
+        if (float(contrast_w * contrast_h)) < (roi_area * 0.0001):
             continue
         
         aspect = float(contrast_w) / float(contrast_h)
-        if aspect < 0.8:
+        if aspect < 0.1:
             continue
         
-        if contrast_h > (h * 0.6):
+        if contrast_h > (h * 0.8):
             continue
         
         temp_mask = np.zeros_like(mask)
@@ -700,7 +698,7 @@ def detect_bands(
         median_peak_dist = max(10.0, w_img / 15.0)
     
     #ベースライン補正
-    base_line_window = int(median_peak_dist * 1.5) | 1
+    base_line_window = int(median_peak_dist * 1.3) | 1
 
     base_line = grey_opening(ssd_signal, size=base_line_window)
 
@@ -714,7 +712,7 @@ def detect_bands(
     noise_floor = max(back_ground_std * 1.2, signal_mad * 1.5)
 
     #Savitzky-Golay
-    sg_window_len = int(median_peak_dist * 0.4) | 1
+    sg_window_len = int(median_peak_dist * 0.3) | 1
     if sg_window_len < 5:
         sg_window_len = 5
         
@@ -723,7 +721,7 @@ def detect_bands(
     #強度ピーク Amplitude
     signal_a = savgol_filter(signal_smooth, window_length=sg_window_len, polyorder=2, deriv=0)
 
-    peaks_a, props_a = find_peaks(signal_a, height=noise_floor, prominence=noise_floor * 0.5, distance=sg_window_len * 0.6)
+    peaks_a, props_a = find_peaks(signal_a, height=noise_floor, prominence=noise_floor * 0.3, distance=sg_window_len * 0.6)
 
     #形状ピーク Derivative Zero-Crossing
     deriv_window = sg_window_len
@@ -817,6 +815,39 @@ def detect_bands(
 
     return result_bands, debug_data
 
+def scan_bands_directional(
+    candidate_bands: List[DetectBand],
+    pitch: float,
+    is_reverse: bool
+) -> List[DetectBand]:
+    
+    if is_reverse:
+        work_list = list(reversed(candidate_bands))
+    else:
+        work_list = list(candidate_bands)
+    
+    valid_chain = [work_list[0]]
+    last_x = work_list[0].x
+
+    for i in range(1, len(work_list)):
+        b = work_list[i]
+        dist = abs(b.x - last_x)
+
+        if pitch == 0:
+            ratio = 0
+        else:
+            ratio = dist / pitch
+        
+        if 0.75 <= ratio <= 2.5:   #金のバンドをわざと離している抵抗器もあるので離れているのは有効とみなす
+            valid_chain.append(b)
+
+            last_x = b.x
+    
+    if is_reverse:
+        valid_chain.reverse()
+    
+    return valid_chain
+
 def refine_band_candidates(
     bands: List[DetectBand],
     roi_width: int
@@ -840,57 +871,74 @@ def refine_band_candidates(
         else:
             return []
     if count == 2:
-        return []
+        return bands
     
-    merged_bands = []
-    
-    current_band = bands[0]
-    
-    for i in range(1, count):
-        next_band = bands[i]
-
-        dist = next_band.x - current_band.x
-        
-        collision_thresh = max(current_band.band_width, next_band.band_width) * 0.8
-
-        if dist < collision_thresh:
-            if next_band.ssd_score > current_band.ssd_score:
-                current_band = next_band
-        else:
-            merged_bands.append(current_band)
-
-            current_band = next_band
-
-    merged_bands.append(current_band)
-
-    if len(merged_bands) < 3:
-        return []
-
-    x_coords = np.array([b.x for b in merged_bands])
+    x_coords = np.array([b.x for b in bands])
     diffs = np.diff(x_coords)
-
     median_pitch = np.median(diffs)
 
-    avg_width = np.mean([b.band_width for b in merged_bands])
-    if median_pitch < avg_width:
-        print("too low confidence")
+    average_width = int(np.mean([b.band_width for b in bands]))
+    most_small_width = [b for b in bands if b.band_width < average_width * 0.5]
+    if most_small_width is not []:
+        for most_small in most_small_width:
+            bands.remove(most_small)
+
+    forward_result = scan_bands_directional(bands, float(median_pitch), is_reverse=False)
+    backward_result = scan_bands_directional(bands, float(median_pitch), is_reverse=True)
+
+    if len(forward_result) >= len(backward_result):
+        refine_bands = forward_result
+    else:
+        refine_bands = backward_result
+
+    target_side:str = ""
     
-    result_bands = [merged_bands[0]]
-    last_x = merged_bands[0].x
+    if len(refine_bands) == 3:
+        if len(refine_bands) > 1:
+            refine_band_x_coords = np.array([b.x for b in refine_bands])
 
-    for i in range(1, len(merged_bands)):
-        band = merged_bands[i]
-        dist = band.x - last_x
-
-        ratio = dist / median_pitch
-
-        if 0.5 <= ratio <= 2.8:
-            result_bands.append(band)
-            last_x = band.x
+            result_pitch = np.mean(np.diff(refine_band_x_coords))
         else:
-            print(f"remove x={band.x}")
+            result_pitch = median_pitch
+
+        first_band_x = refine_bands[0].x
+        last_band_x = refine_bands[-1].x
+
+        left_margin = first_band_x
+        right_margin = roi_width - last_band_x
+
+        predicted_band = None
+
+        if left_margin > right_margin:
+            target_side = "left"
+        else:
+            target_side = "right"
     
-    return result_bands
+        if target_side == "left":
+            pred_x = int(float(first_band_x) - result_pitch)
+
+            if pred_x > 0:
+                predicted_band = DetectBand(
+                    pred_x, average_width, (0,0,0), 0.0
+                )
+            else:
+                print(f"fail left {pred_x}, {roi_width}, {target_side}, {left_margin}, {right_margin}")
+        elif target_side == "right":
+            pred_x = int(float(last_band_x) + result_pitch)
+
+            if pred_x < roi_width:
+                print(f">> Extrapolating RIGHT band at {pred_x}")
+                predicted_band = DetectBand(
+                    pred_x, average_width, (0,0,0), 0.0
+                )
+            else:
+                print(f"fail right {pred_x}, {roi_width}")
+
+        if predicted_band:
+            refine_bands.append(predicted_band)
+            refine_bands.sort(key=lambda b: b.x)
+
+    return refine_bands
 
 
 if __name__ == "__main__":
