@@ -39,7 +39,7 @@ class DetectBand:
     x: int
     band_width: int
     mean_color_lab: Tuple[float, float, float]
-    ssd_score: float
+    energy_score: float
 
 IMG_INPUT_DIR:str = "./output_resistors"
 IMG_OUTPUT_DIR:str = "./result"
@@ -61,52 +61,35 @@ LAB_CHROMA_LIMIT = 30.0
 # 局所平均を計算する窓サイズ比率
 LOCAL_WINDOW_RATIO = 0.15
 
-MORPH_KERNEL_RATIO_W = 0.05
-MORPH_KERNEL_MIN_PX = 3
-MORPH_KERNEL_MAX_PX = 20
-
-# ヒストグラムのピーク(ボディの明るさ)から、どれくらい離れればグレアとみなすか
-L_PEAK_MARGIN: float = 20.0  
-# どんなに暗い画像でも、このL値を下回るものはグレアと判定しない（絶対下限）
-L_ABSOLUTE_MIN: float = 50.0 
-
-# 理想的なグレアはS=0だが、境界部分のボケや圧縮ノイズを考慮して広めに取る。
-# 最終判定は L(高) AND ab(無彩色) との組み合わせで行うため、ここはリコール重視で甘めに設定。
-S_THRESHOLD_MAX: float = 0.25
-
-# MAD (Median Absolute Deviation) に掛ける係数。正規分布の3σ相当などを狙う。
-AB_MAD_FACTOR: float = 4.0
-# ab距離の閾値のハードリミット（最小2.0はノイズ許容、最大15.0は有彩色バンド除外）
-AB_DIST_MIN: float = 2.0
-AB_DIST_MAX: float = 15.0
-
-# 画像幅に対するカーネル幅の比率（経験値）。
-# 将来的には「抵抗器の物理直径(mm) × 解像度(px/mm)」から算出することが望ましい。
-MORPH_KERNEL_RATIO_W: float = 0.015
-MORPH_KERNEL_MAX_PX: int = 5
-MORPH_KERNEL_MIN_PX: int = 3
-
-# 最終的な候補領域内の最大輝度が、全体の上位0.5%輝度の何割以上か
-L_CHECK_RATIO: float = 0.90
-# 最終チェック時の絶対下限輝度
-L_CHECK_MIN: float = 70.0
-
-#分割したセグメントの重み 中央のセグメントほど優先
-Y_CENTER_WEIGHTS = {0: 0.7, 1: 0.85, 2: 1.0, 3: 0.85, 4: 0.7}
-
-#ab分散閾値
-AB_VARIANCE_MIN_SAFE: float = 100.0
-AB_VARIANCE_MAX_SAFE: float = 400.0
-
 MIN_SPLIT_SEGMENT: int = 5
-GLARE_MAX_SOFT: float = 0.15
 
 AB_VALIANCE_CLIP = 800.0
 
-SN_RATIO_LOW: float = 3.0
-SN_RATIO_HIGH: float = 10.0
+#WEIGHT_CHROMA:float = 2.0       # 色差(a,b)重視
+WEIGHT_LUMA_DARK:float = 1.2    # 輝度(L)は標準
+WEIGHT_LUMA_BRIGHT:float = 0.1  # テカリは抑制
+
+# 幾何パラメータ (Geometry)
+# 最小バンド幅: 物理的な最小サイズ（抵抗器の規格や解像度から決まる定数）
+# ここでは画像幅の1%としているが、本来は固定ピクセル数が望ましい
+MIN_BAND_WIDTH_RATIO:float = 0.01
+BASELINE_WINDOW_FACTOR:int = 5   # ベースライン推定窓は最小バンド幅の何倍か
+
+# 閾値パラメータ (Thresholds)
+MAD_FACTOR:float = 1.0             # ノイズフロア推定係数
+SYSTEM_NOISE_FACTOR:float = 0.6
+PROMINENCE_RATIO:float = 1.5       # S/N比として、ノイズの何倍の突出を信号とするか
+
+# 色差判定 (JND: Just Noticeable Difference)
+# CIE76においてDelta E < 2.3 は「目視で差が識別できない」とされる
+# ここでは安全マージンを取り 3.0 を閾値とする
+JAD_AB_THRESHOLD:float = 2.3
+#SHADOW_LUMA_THRESHOLD:float = 20.0
+SHADOW_LUMA_THRESHOLD:float = 12.5
 
 def main():
+    file_count = 0
+    
     save_dir = Path(IMG_OUTPUT_DIR)
     
     for f in save_dir.glob("*"):
@@ -163,10 +146,6 @@ def main():
 
         back_ground_stats: BackGroundStats = analyze_resistor_background(lab_one_line, valid_pixels_ratio)
 
-        print(
-            f"{back_ground_stats.color_lab}, {back_ground_stats.occupancy_ratio}, {back_ground_stats.ab_variance}, {back_ground_stats.is_reliable}"
-        )
-
         result_bands, debug_data = detect_bands(lab_one_line, back_ground_stats)
 
         print("band_result start")
@@ -176,9 +155,10 @@ def main():
 
         correction_result_bands = refine_band_candidates(result_bands, w)
 
-        points = [(x.x) for x in correction_result_bands]
-        print(f"w = {w}, h = {h}")
-        print(f"points = {points}")
+        #points = [(x.x) for x in correction_result_bands]
+        points = [(x.x) for x in result_bands]
+        #print(f"w = {w}, h = {h}")
+        #print(f"points = {points}")
 
         l_segment_u8 = (lab_segment[:, :, 0] * (255.0 / 100.0)).astype(np.uint8)
         a_segment_u8 = (lab_segment[:, :, 1] + 128.0).astype(np.uint8)
@@ -234,12 +214,14 @@ def main():
         debug_imgs = cv2.resize(debug_imgs, None, fx=5, fy=5, interpolation=cv2.INTER_NEAREST)
 
 
-        save_name = file.name
+        save_name = f"{file_count:03d}.bmp"
         save_path =  save_dir / save_name
 
         cv2.imwrite(str(save_path), debug_imgs)
 
         print(f"save {save_path}")
+
+        file_count += 1
 
        
 def check_resistor_roi_quality(roi: NDArray[np.uint8] | None) -> bool:
@@ -540,40 +522,39 @@ def select_best_segment(
     return cast(NDArray[np.float32], lab_f[stats_list[0].y_top:stats_list[0].y_bottom, :]), stats_list[0].valid_pixels_ratio
 
 def compress_segment_to_one_line(segment_lab: NDArray[np.float32]) -> NDArray[np.float32]:
-    h, w, c = segment_lab.shape
+    l_plane = segment_lab[:, :, 0]
 
-    one_line = np.zeros((1, w, c), dtype=np.float32)
+    med_l = np.median(l_plane, axis=0)
+
+    # ブロードキャストにより (H, W) - (W,) の計算が一発で行われます
+    abs_diff = np.abs(l_plane - med_l)
+
+    mad_l = np.median(abs_diff, axis=0)
+
+    # ゼロ除算対策: MADが極小の場合は 1.0 に置換 (np.whereで条件分岐もベクトル化)
+    mad_l = np.where(mad_l < 1e-6, 1.0, mad_l)
+
+    modified_z_score = 0.6745 * abs_diff / mad_l
+
+    valid_mask = modified_z_score <= 3.5
+
+    # 列ごとの有効画素数をカウント -> shape: (W,)
+    valid_counts = np.sum(valid_mask, axis=0)
     
-    cols = np.transpose(segment_lab, (1, 0, 2))
+    # フォールバックすべき列のフラグ -> shape: (W,)
+    fallback_cols = valid_counts < 3
 
-    for x in range(w):
-        col_pixels = cols[x]
+    # fallback_cols[np.newaxis, :] で (1, W) にして (H, W) と演算
+    final_mask = valid_mask | fallback_cols[np.newaxis, :]
 
-        l_vals = col_pixels[:, 0]
-        
-        med_l = np.median(l_vals)
-        
-        abs_diff = np.abs(l_vals - med_l)
-        mad_l = np.median(abs_diff)
-        
-        if mad_l < 1e-6:
-            mad_l = 1.0
-        
-        # 係数 0.6745 は正規分布換算用
-        modified_z_score = 0.6745 * abs_diff / mad_l
-        
-        valid_mask = modified_z_score <= 3.5
-        
-        if np.count_nonzero(valid_mask) < 3:
-            final_pixels = col_pixels
-        else:
-            final_pixels = col_pixels[valid_mask]
+    masked_data = segment_lab.copy()
+    masked_data[~final_mask] = np.nan
 
-        one_line[0, x, 0] = np.median(final_pixels[:, 0])
-        one_line[0, x, 1] = np.median(final_pixels[:, 1])
-        one_line[0, x, 2] = np.median(final_pixels[:, 2])
+    # np.nanmedian を使い、NaNを無視して縦方向(axis=0)の中央値を計算
+    # keepdims=True で (1, W, C) の形状を維持
+    one_line = np.nanmedian(masked_data, axis=0, keepdims=True)
 
-    return one_line
+    return one_line.astype(np.float32)
 
 def analyze_resistor_background(
     lab_one_line: NDArray[np.float32],
@@ -650,6 +631,23 @@ def analyze_resistor_background(
 
     return result
 
+def calculate_dynamic_chroma_weight(ab_variance: float) -> float:
+    # 基準となる標準偏差 (経験的に、綺麗な抵抗器背景は sigma=5.0~8.0 程度)
+    REFERENCE_SIGMA = 10.0
+    
+    # 現在の背景の標準偏差
+    current_sigma = np.sqrt(ab_variance)
+    if current_sigma < 1.0: current_sigma = 1.0
+
+    # 基準より綺麗なら重みが増え、汚ければ減る
+    # ベースを 1.5 とし、最大 2.0倍 程度までブーストさせるイメージ
+    weight = 1.5 * (REFERENCE_SIGMA / current_sigma)
+
+    # クランプ処理
+    # 最小 1.5: どんなに汚くても「金」などを検出するために最低限の色評価は必要
+    # 最大 3.5: 綺麗ならかなり強気攻めてOK
+    return float(np.clip(weight, 1.5, 3.5))
+
 def detect_bands(
     lab_one_line: NDArray[np.float32],
     back_ground_stats: BackGroundStats,
@@ -657,161 +655,130 @@ def detect_bands(
 ) -> Tuple[List[DetectBand], dict]:
 
     w_img = lab_one_line.shape[1]
-
     pixels = lab_one_line[0]
 
-    #SSD
+    # --- 1. エネルギー信号計算 (Weighted Euclidean Distance) ---
+    # 旧: ssd_signal (名称誤り) -> 新: energy_signal
+    # 定義: 背景ベクトルからの「重み付き距離」
+    
+    # Chroma (Color distance squared)
     pixel_ab = pixels[:, 1:]
     back_ground_ab = np.array(back_ground_stats.color_lab[1:])
-
     diff_sq_ab = np.sum((pixel_ab - back_ground_ab)**2, axis=1)
 
+    # Luma (Brightness distance squared with asymmetric potential)
     back_ground_l = back_ground_stats.color_lab[0]
     pixel_l = pixels[:, 0]
-
     delta_l = back_ground_l - pixel_l
 
-    diff_l_dark = np.maximum(0, delta_l)
-
-    diff_l_bright = np.minimum(np.maximum(0, -delta_l), 30.0)
-
-    diff_sq_total = diff_sq_ab + (1.0 * diff_l_dark) ** 2 + (0.8 * diff_l_bright) ** 2
-        
-    ssd_signal = np.sqrt(diff_sq_total)
-
-    #scale
-    ssd_pre_smooth = gaussian_filter1d(ssd_signal, sigma=1.0)
-
-    raw_mad = np.median(np.abs(ssd_pre_smooth - np.median(ssd_pre_smooth)))
-    if raw_mad < 1.0:
-        raw_mad = 1.0
+    dynamic_weight_chroma = calculate_dynamic_chroma_weight(back_ground_stats.ab_variance)
     
-    prov_peaks, _ = find_peaks(ssd_pre_smooth, prominence=raw_mad * 3.0, distance=3)
+    term_chroma = dynamic_weight_chroma * diff_sq_ab
 
-    if len(prov_peaks) > 1:
-        peak_diffs = np.diff(prov_peaks)
+    term_luma_dark = (WEIGHT_LUMA_DARK * np.maximum(0, delta_l)) ** 2
+    term_luma_bright = (WEIGHT_LUMA_BRIGHT * np.minimum(np.maximum(0, -delta_l), 50.0)) ** 2
 
-        median_peak_dist = np.median(peak_diffs)
-    else:
-        median_peak_dist = max(10.0, w_img / 15.0)
+    # Unit: Distance in weighted Lab space
+    energy_signal = np.sqrt(term_chroma + term_luma_dark + term_luma_bright)
+
+    # --- 2. ベースライン補正 ---
+    # 物理的な「最小バンド幅」を基準に、それより大きなうねりをベースラインとして除去
+    min_band_width_px = max(3, int(w_img * MIN_BAND_WIDTH_RATIO))
     
-    #ベースライン補正
-    base_line_window = int(median_peak_dist * 1.3) | 1
-
-    base_line = grey_opening(ssd_signal, size=base_line_window)
-
-    signal_corrected = ssd_signal - base_line
+    baseline_window_size = (min_band_width_px * BASELINE_WINDOW_FACTOR) | 1
+    base_line = grey_opening(energy_signal, size=baseline_window_size)
+    
+    signal_corrected = energy_signal - base_line
+    
+    # --- 3. ノイズ除去 (Gaussian Filter) ---
+    # 修正: SGフィルタ(多項式近似)は廃止。
+    # 目的は「センサ起因の高周波ノイズ除去」であり、バンド幅(幾何)とは無関係。
+    # sigma=1.0 は一般的なセンサノイズ抑制の標準値。
     signal_smooth = gaussian_filter1d(signal_corrected, sigma=1.0)
 
-    #パラメータ
-    back_ground_std = np.sqrt(back_ground_stats.ab_variance)
+    # --- 4. ノイズフロア推定 (MAD) ---
+    # ベースライン補正済みのため、信号の中央値は0付近と仮定できるが、
+    # 念のため median を引いた偏差を見る (Robust MAD)
     signal_mad = np.median(np.abs(signal_smooth - np.median(signal_smooth)))
+    if signal_mad < 1e-6: signal_mad = 1e-6
 
-    noise_floor = max(back_ground_std * 1.2, signal_mad * 1.5)
-
-    #Savitzky-Golay
-    sg_window_len = int(median_peak_dist * 0.3) | 1
-    if sg_window_len < 5:
-        sg_window_len = 5
-        
-    match_tolerance = max(5.0, float(median_peak_dist * 0.4))
-
-    #強度ピーク Amplitude
-    signal_a = savgol_filter(signal_smooth, window_length=sg_window_len, polyorder=2, deriv=0)
-
-    peaks_a, props_a = find_peaks(signal_a, height=noise_floor, prominence=noise_floor * 0.3, distance=sg_window_len * 0.6)
-
-    #形状ピーク Derivative Zero-Crossing
-    deriv_window = sg_window_len
-    signal_b_deriv = savgol_filter(signal_smooth, window_length=deriv_window, polyorder=2, deriv=1)
-
-    #print(f"debug signal_b_deriv = {signal_b_deriv}")
-
-    deriv_median = np.median(signal_b_deriv)
-    deriv_abs_dev = np.abs(signal_b_deriv - deriv_median)
-
-    deriv_mad = np.median(deriv_abs_dev)
-    if deriv_mad < 1e-6:
-        #0.6745 正規分布換算
-        deriv_mad = np.std(signal_b_deriv) * 0.6745
-
-    slope_epsilon = 0.01
-
-    zero_crossings_b = []
-
-    for i in range(1, w_img - 1):
-        d_prev = signal_b_deriv[i - 1]
-        d_next = signal_b_deriv[i + 1]
-
-        #print(f"debug d_prev = {d_prev}, d_next = {d_next}")
-
-        if d_prev > 0 and d_next < 0:
-            #if abs(d_prev - d_next) > slope_epsilon:
-            if d_prev > slope_epsilon or d_next < -slope_epsilon:
-                zero_crossings_b.append(i)
+    # 最小システムノイズのガード (背景分散由来)
+    back_ground_std = np.sqrt(back_ground_stats.ab_variance)
+    system_noise_floor = back_ground_std * 0.8
     
-    zero_crossings_b = np.array(zero_crossings_b)
+    estimated_noise_floor = signal_mad * MAD_FACTOR
+    final_noise_floor = max(estimated_noise_floor, system_noise_floor)
 
-    #print(f"debug : zero_crossings_b count = {len(zero_crossings_b)}")
+    # --- 5. ピーク検出 (Prominence Only) ---
+    # 修正: height制限を撤廃 (二重拘束の解消)。
+    # 「絶対的な高さ」ではなく「周囲のノイズフロアに対してどれだけ突出しているか」のみで判定する。
+    min_prominence = final_noise_floor * PROMINENCE_RATIO
 
-    #統合
+    peaks, properties = find_peaks(
+        signal_smooth,
+        prominence=min_prominence,     # 相対高さのみを見る
+        width=min_band_width_px * 0.5, # 物理的な幅制約
+        rel_height=0.75
+    )
+
     result_bands = []
     
-    if len(peaks_a) > 0:
-        widths, width_heights, left_ips, right_ips = peak_widths(signal_a, peaks_a, rel_height=0.6)
-    
-    #print(f"debug : peaks_a = {peaks_a}")
+    if len(peaks) > 0:
+        left_ips = properties["left_ips"]
+        right_ips = properties["right_ips"]
         
-    for i, x_a in enumerate(peaks_a):
-        #print("debug info : code[for i, x_a in enumerate(peaks_a):]")
-        #print(f"debug zero_crossings_b = {zero_crossings_b}")
+        back_ground_l = back_ground_stats.color_lab[0]
+        back_ground_a = back_ground_stats.color_lab[1]
+        back_ground_b = back_ground_stats.color_lab[2]
 
-        valid_b = False
-
-        x_left = left_ips[i]
-        x_right = right_ips[i]
-        
-        if len(zero_crossings_b) > 0:
-            is_within_width = (zero_crossings_b >= x_left) & (zero_crossings_b <= x_right)
-            if np.any(is_within_width):
-                valid_b = True
-        
-        if valid_b:
-            index_start = max(0, int(np.floor(left_ips[i])))
-            index_end = min(w_img, int(np.ceil(right_ips[i])))
-
+        for i, x_peak in enumerate(peaks):
+            x_left = left_ips[i]
+            x_right = right_ips[i]
+            
+            index_start = max(0, int(np.floor(x_left)))
+            index_end = min(w_img, int(np.ceil(x_right)))
             band_width = index_end - index_start
+            
+            if band_width < 2: continue
 
-            if band_width < 2:
-                continue
-        
             band_pixels = pixels[index_start:index_end]
-
             mean_l = float(np.median(band_pixels[:, 0]))
             mean_a = float(np.median(band_pixels[:, 1]))
             mean_b = float(np.median(band_pixels[:, 2]))
 
+            # --- 影(Shadow)判定 ---
+            # a,b 平面での距離 (ユークリッド距離)
+            dist_ab = np.sqrt((mean_a - back_ground_a)**2 + (mean_b - back_ground_b)**2)
+
+            delta_l_band = back_ground_l - mean_l
+            
+            is_low_chroma_diff = (dist_ab < JAD_AB_THRESHOLD)
+            is_darker = (delta_l_band > 0)
+            
+            is_shadow = is_low_chroma_diff and is_darker and (delta_l_band < SHADOW_LUMA_THRESHOLD)
+
+            if is_shadow:
+                continue
+
             result_bands.append(DetectBand(
-                int(x_a),
-                int(band_width),
-                (mean_l, mean_a, mean_b),
-                float(signal_a[x_a])
+                x=int(x_peak),
+                band_width=int(band_width),
+                mean_color_lab=(mean_l, mean_a, mean_b),
+                energy_score=float(signal_smooth[x_peak]) 
             ))
-    
+
     debug_data = {
-        "ssd_original": ssd_signal,
+        "energy_signal": energy_signal, # 変数名変更を反映
         "baseline": base_line,
-        "signal_corrected": signal_corrected,
-        "signal_a": signal_a,
-        "signal_b_deriv": signal_b_deriv,
-        "peaks_a": peaks_a,
-        "zeros_b": zero_crossings_b,
-        "noise_floor": noise_floor,
-        "slope_epsilon": slope_epsilon,
-        "median_dist": median_peak_dist # 確認用
+        "signal_smooth": signal_smooth,
+        "noise_floor": final_noise_floor,
+        "peaks": peaks
     }
 
+    print(debug_data)
+
     return result_bands, debug_data
+    
 
 def scan_bands_directional(
     candidate_bands: List[DetectBand],
@@ -912,7 +879,7 @@ def refine_band_candidates(
         else:
             target_side = "right"
         
-        print(f"result pitch = {result_pitch}")
+        #print(f"result pitch = {result_pitch}")
     
         if target_side == "left":
             pred_x = int(float(first_band_x) - result_pitch)
@@ -922,17 +889,18 @@ def refine_band_candidates(
                     int(result_pitch // 2), average_width, (0,0,0), 0.0
                 )
             else:
-                print(f"fail left {pred_x}, {roi_width}, {target_side}, {left_margin}, {right_margin}")
+                pass
+                #print(f"fail left {pred_x}, {roi_width}, {target_side}, {left_margin}, {right_margin}")
         elif target_side == "right":
             pred_x = int(float(last_band_x) + result_pitch)
 
             if pred_x < roi_width:
-                print(f">> Extrapolating RIGHT band at {pred_x}")
                 predicted_band = DetectBand(
-                    int(roi_width - (result_pitch // 2)), average_width, (0,0,0), 0.0
+                    int(roi_width - ((result_pitch // 3) * 2)), average_width, (0,0,0), 0.0
                 )
             else:
-                print(f"fail right {pred_x}, {roi_width}")
+                pass
+                #print(f"fail right {pred_x}, {roi_width}")
 
         if predicted_band:
             refine_bands.append(predicted_band)
