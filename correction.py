@@ -47,9 +47,26 @@ IMG_OUTPUT_DIR:str = "./result"
 #定数
 MIN_EXPECTED_ASPECT_AFTER_ALIGNMENT:float = 2.5
 
+Z_SCORE_THRESHOLD = 1.0
+
+# ノイズモデル: Noise ≈ sqrt( ReadNoise^2 + (Gain * Signal)^2 )
+# SHOT_NOISE_FACTOR: 信号強度に比例するノイズ成分 (例: 0.05 = 輝度の5%程度のゆらぎを許容)
+SHOT_NOISE_FACTOR = 0.001
+# READ_NOISE_EPSILON: 暗部でのゼロ除算防止および最低限のフロアノイズ
+READ_NOISE_EPSILON = 2.0
+
+# 無彩色判定の半径 (0-127 scale)
+LAB_CHROMA_LIMIT = 30.0
+
+# 局所平均を計算する窓サイズ比率
+LOCAL_WINDOW_RATIO = 0.15
+
+MORPH_KERNEL_RATIO_W = 0.05
+MORPH_KERNEL_MIN_PX = 3
+MORPH_KERNEL_MAX_PX = 20
+
 # ヒストグラムのピーク(ボディの明るさ)から、どれくらい離れればグレアとみなすか
-#L_PEAK_MARGIN: float = 20.0  
-L_PEAK_MARGIN: float = 10.0  
+L_PEAK_MARGIN: float = 20.0  
 # どんなに暗い画像でも、このL値を下回るものはグレアと判定しない（絶対下限）
 L_ABSOLUTE_MIN: float = 50.0 
 
@@ -72,8 +89,7 @@ MORPH_KERNEL_MIN_PX: int = 3
 # 最終的な候補領域内の最大輝度が、全体の上位0.5%輝度の何割以上か
 L_CHECK_RATIO: float = 0.90
 # 最終チェック時の絶対下限輝度
-#L_CHECK_MIN: float = 70.0
-L_CHECK_MIN: float = 50.0
+L_CHECK_MIN: float = 70.0
 
 #分割したセグメントの重み 中央のセグメントほど優先
 Y_CENTER_WEIGHTS = {0: 0.7, 1: 0.85, 2: 1.0, 3: 0.85, 4: 0.7}
@@ -161,6 +177,8 @@ def main():
         correction_result_bands = refine_band_candidates(result_bands, w)
 
         points = [(x.x) for x in correction_result_bands]
+        print(f"w = {w}, h = {h}")
+        print(f"points = {points}")
 
         l_segment_u8 = (lab_segment[:, :, 0] * (255.0 / 100.0)).astype(np.uint8)
         a_segment_u8 = (lab_segment[:, :, 1] + 128.0).astype(np.uint8)
@@ -285,54 +303,11 @@ def clip_resistor_roi(roi: NDArray[np.uint8] | None) -> NDArray[np.uint8] | None
 
     h, w = roi.shape[:2]
 
-    trim_w = int(w * 0.01)
+    trim_w = int(w * 0.005)
     trim_h = int(h * 0.05)
 
     return roi[trim_h : h-trim_h, trim_w : w-trim_w]
 
-def estimate_glare_l_threshold_peak(l_roi: NDArray[np.float32]) -> float:
-    hist_bins = 100
-    l_large_max = 100.0
-    
-    hist = cv2.calcHist([l_roi], [0], None, [hist_bins], [0.0, l_large_max])
-
-    peak_index = int(np.argmax(hist))
-
-    bin_width = l_large_max / float(hist_bins)
-    peak_l_value = float(peak_index) * bin_width
-    
-    base_threshold = peak_l_value + L_PEAK_MARGIN
-    
-    p90 = float(np.percentile(l_roi, 90.0))
-
-    tmp_l_threshold = max(base_threshold, L_ABSOLUTE_MIN)
-
-    return min(tmp_l_threshold, p90)
-
-def get_adaptive_white_point(
-    a_roi: NDArray[np.float32],
-    b_roi: NDArray[np.float32],
-    s_roi: NDArray[np.float32]
-) -> Tuple[float, float]:
-    low_s_mask = s_roi < 0.25
-    
-    if np.count_nonzero(low_s_mask) < 10:
-        return 128.0, 128.0
-    
-    a_reference = float(np.median(a_roi[low_s_mask]))
-    b_reference = float(np.median(b_roi[low_s_mask]))
-
-    return a_reference, b_reference
-
-def get_chroma_threshold(chroma_dist: NDArray[np.float32]) -> float:
-    median = np.median(chroma_dist)
-
-    absolute_deviation = np.abs(chroma_dist - median)
-    mad = np.median(absolute_deviation)
-
-    threshold = median + (AB_MAD_FACTOR * mad)
-
-    return float(np.clip(threshold, AB_DIST_MIN, AB_DIST_MAX))
 
 def create_specular_mask(
     clipped_roi: NDArray[np.uint8] | None
@@ -340,79 +315,102 @@ def create_specular_mask(
     if clipped_roi is None:
         return None
     
-    roi_f = clipped_roi.astype(np.float32) / 255.0
+    if clipped_roi is None:
+        return None
 
-    h, w = roi_f.shape[:2]
+    h, w = clipped_roi.shape[:2]
 
-    roi_f = cv2.bilateralFilter(roi_f, d=5, sigmaColor=50, sigmaSpace=50)
+    # ---------------------------------------------------------
+    # 1. Color Space Conversion (Raw Data)
+    # ---------------------------------------------------------
+    # 前処理フィルタはかけず、ピーク形状を保存する
+    lab = cv2.cvtColor(clipped_roi, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    
+    l_float = l_ch.astype(np.float32)
 
-    hsv_f = cv2.cvtColor(roi_f, cv2.COLOR_BGR2HSV)
-    lab_f = cv2.cvtColor(roi_f, cv2.COLOR_BGR2LAB)
+    # ---------------------------------------------------------
+    # 2. Chromaticity Constraint (Physics)
+    # ---------------------------------------------------------
+    # 中心(128)からのユークリッド距離で彩度を評価
+    a_centered = a_ch.astype(np.float32) - 128.0
+    b_centered = b_ch.astype(np.float32) - 128.0
+    chroma = np.sqrt(a_centered**2 + b_centered**2)
+    
+    # Gate 1: 色度による制約 (無彩色であること)
+    mask_achromatic = chroma < LAB_CHROMA_LIMIT
 
-    s_roi = cast(NDArray[np.float32], hsv_f[:, :, 1])
+    # ---------------------------------------------------------
+    # 3. Statistical Peak Detection (Signal-Dependent Z-score)
+    # ---------------------------------------------------------
+    # 窓サイズ決定
+    ksize = int(w * LOCAL_WINDOW_RATIO)
+    if ksize % 2 == 0: ksize += 1
+    ksize = max(3, ksize)
 
-    l_roi = cast(NDArray[np.float32], lab_f[:, :, 0])
-    a_roi = cast(NDArray[np.float32], lab_f[:, :, 1])
-    b_roi = cast(NDArray[np.float32], lab_f[:, :, 2])
+    # モーメント計算 (BoxFilter)
+    # E[X] (局所平均)
+    mu = cv2.boxFilter(l_float, -1, (ksize, ksize))
+    # E[X^2]
+    mu2 = cv2.boxFilter(l_float**2, -1, (ksize, ksize))
+    
+    # Variance = E[X^2] - (E[X])^2
+    variance = mu2 - mu**2
+    variance = np.maximum(variance, 0)
+    sigma_local = np.sqrt(variance)
+    
+    # --- ノイズモデルの適用 (修正箇所) ---
+    # 定数フロアではなく、信号強度(mu)に依存する項を追加
+    # Denominator^2 = σ_local^2 + (k * μ)^2 + ε^2
+    # 明部では (k * μ) が支配的になり、Z-scoreの過敏な反応を抑える
+    # 暗部では ε が支配的になり、ゼロ除算を防ぐ
+    noise_model = (SHOT_NOISE_FACTOR * mu)**2 + READ_NOISE_EPSILON**2
+    denominator = np.sqrt(sigma_local**2 + noise_model)
+    
+    # Z-score = (Signal - Mean) / Estimated_Noise_spread
+    z_score = (l_float - mu) / denominator
+    
+    # Gate 2: 統計的有意性 (局所ピーク判定)
+    mask_peak = z_score > Z_SCORE_THRESHOLD
 
-    s_threshold = min(S_THRESHOLD_MAX, np.percentile(s_roi, 20.0))
+    # ---------------------------------------------------------
+    # 4. Integration
+    # ---------------------------------------------------------
+    # 統計条件(Peak) AND 物理条件(Achromatic)
+    candidates = np.logical_and(mask_peak, mask_achromatic)
+    candidates_u8 = (candidates * 255).astype(np.uint8)
 
-    l_threshold = estimate_glare_l_threshold_peak(l_roi)
+    # モルフォロジー演算は行わない (微小なピーク情報を保存するため)
 
-    a_reference, b_reference = get_adaptive_white_point(a_roi, b_roi, s_roi)
+    # ---------------------------------------------------------
+    # 5. Geometry Check
+    # ---------------------------------------------------------
+    contours, _ = cv2.findContours(candidates_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros_like(candidates_u8)
+    
+    # 像として成立する最小面積 (ホットピクセル除去)
+    MIN_PIXEL_AREA = 2.0 
 
-    chroma_distention = np.sqrt((a_roi - a_reference)**2 + (b_roi - b_reference)**2)
-
-    ab_threshold = get_chroma_threshold(chroma_distention)
-
-    mask_s = s_roi < s_threshold
-
-    mask_l = l_roi > l_threshold
-    mask_ab = chroma_distention < ab_threshold
-
-    candidates = np.logical_and(mask_l, mask_s)
-    candidates = np.logical_and(candidates, mask_ab)
-
-    candidates = (candidates * 255).astype(np.uint8)
-
-    k_w_calc = int(float(w) * MORPH_KERNEL_RATIO_W)
-    k_x = min(MORPH_KERNEL_MAX_PX, max(MORPH_KERNEL_MIN_PX, k_w_calc))
-
-    k_y = 1
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_x | 1, k_y))
-    #kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))  #1/4[W]のみを想定 pxが20x50程度のため
-    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN, kernel)
-
-    contours, _ = cv2.findContours(candidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask = np.zeros_like(candidates)
-
-    roi_area = float(h * w)
-
-    p99 = float(np.percentile(l_roi, 99.0))
-    glare_peak_floor = max(p99 * L_CHECK_RATIO, L_CHECK_MIN)
-
-    for contrast in contours:
-        x, y, contrast_w, contrast_h = cv2.boundingRect(contrast)
-
-        if (float(contrast_w * contrast_h)) < (roi_area * 0.0001):
-            continue
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
         
-        aspect = float(contrast_w) / float(contrast_h)
+        if area < MIN_PIXEL_AREA:
+            continue
+
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw == 0 or ch == 0: continue
+        
+        # 形状フィルタ (極端なノイズ除去)
+        aspect = float(cw) / float(ch)
         if aspect < 0.1:
             continue
-        
-        if contrast_h > (h * 0.8):
-            continue
-        
-        temp_mask = np.zeros_like(mask)
-        cv2.drawContours(temp_mask, [contrast], -1, 255, -1)
-
-        _, max_val, _, _ = cv2.minMaxLoc(l_roi, mask=temp_mask)
-        if max_val < glare_peak_floor:
-            continue
-        
-        cv2.drawContours(mask, [contrast], -1, 255, -1)
+            
+        cv2.drawContours(mask, [cnt], -1, 255, -1)
+    
+    print(f"L range: {l_float.min():.1f} - {l_float.max():.1f}")
+    print(f"Chroma range: {chroma.min():.1f} - {chroma.max():.1f} (Limit: {LAB_CHROMA_LIMIT})")
+    print(f"Z-score range: {z_score.min():.2f} - {z_score.max():.2f} (Thresh: {Z_SCORE_THRESHOLD})")
+    print(f"Sigma range: {sigma_local.min():.1f} - {sigma_local.max():.1f}")
 
     return cast(NDArray[np.uint8], mask)
 
@@ -716,7 +714,7 @@ def detect_bands(
     if sg_window_len < 5:
         sg_window_len = 5
         
-    match_tolerance = max(5.0, median_peak_dist * 0.4)
+    match_tolerance = max(5.0, float(median_peak_dist * 0.4))
 
     #強度ピーク Amplitude
     signal_a = savgol_filter(signal_smooth, window_length=sg_window_len, polyorder=2, deriv=0)
@@ -913,13 +911,15 @@ def refine_band_candidates(
             target_side = "left"
         else:
             target_side = "right"
+        
+        print(f"result pitch = {result_pitch}")
     
         if target_side == "left":
             pred_x = int(float(first_band_x) - result_pitch)
 
             if pred_x > 0:
                 predicted_band = DetectBand(
-                    pred_x, average_width, (0,0,0), 0.0
+                    int(result_pitch // 2), average_width, (0,0,0), 0.0
                 )
             else:
                 print(f"fail left {pred_x}, {roi_width}, {target_side}, {left_margin}, {right_margin}")
@@ -929,7 +929,7 @@ def refine_band_candidates(
             if pred_x < roi_width:
                 print(f">> Extrapolating RIGHT band at {pred_x}")
                 predicted_band = DetectBand(
-                    pred_x, average_width, (0,0,0), 0.0
+                    int(roi_width - (result_pitch // 2)), average_width, (0,0,0), 0.0
                 )
             else:
                 print(f"fail right {pred_x}, {roi_width}")
@@ -943,4 +943,3 @@ def refine_band_candidates(
 
 if __name__ == "__main__":
     main()
-        
