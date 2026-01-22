@@ -1,6 +1,6 @@
 #!/bin/env python3
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 import re
 
@@ -12,6 +12,8 @@ from typing import cast, List, TypedDict, Tuple, Optional, Dict, Any
 from enum import Enum, auto
 from scipy.signal import savgol_filter, find_peaks, peak_widths
 from scipy.ndimage import gaussian_filter1d, grey_opening
+import pandas as pd
+import joblib
 
 #セグメント分割時に使用 データクラス
 @dataclass
@@ -40,6 +42,55 @@ class DetectBand:
     band_width: int
     mean_color_lab: Tuple[float, float, float]
     energy_score: float
+
+@dataclass
+class EstimateBand:
+    band_rate: float    #band_width / pitch
+    symmetry: float
+    log_norm: float
+    std_l: float
+
+@dataclass
+class BandColor:
+    mean_l: float
+    mean_a: float
+    mean_b: float
+    mean_c: float
+    std_l: float
+
+class Color(Enum):
+    BLACK = 0
+    BROWN = 1
+    RED = 2
+    ORANGE = 3
+    YELLOW = 4
+    GREEN = 5
+    BLUE = 6
+    PURPLE = 7
+    GRAY = 8
+    WHITE = 9
+    GOLD_DARK = 10
+    GOLD_LITE = 11
+
+@dataclass
+class BandColorResult:
+    x: int
+    color: Color
+
+RESISTOR_PARAMS = {
+    Color.BLACK:     {"value": 0, "multiplier": 1,           "tolerance": None},
+    Color.BROWN:     {"value": 1, "multiplier": 10,          "tolerance": 1.0},
+    Color.RED:       {"value": 2, "multiplier": 100,         "tolerance": 2.0},
+    Color.ORANGE:    {"value": 3, "multiplier": 1000,        "tolerance": None},
+    Color.YELLOW:    {"value": 4, "multiplier": 10000,       "tolerance": None},
+    Color.GREEN:     {"value": 5, "multiplier": 100000,      "tolerance": 0.5},
+    Color.BLUE:      {"value": 6, "multiplier": 1000000,     "tolerance": 0.25},
+    Color.PURPLE:    {"value": 7, "multiplier": 10000000,    "tolerance": 0.1},
+    Color.GRAY:      {"value": 8, "multiplier": None,        "tolerance": None},
+    Color.WHITE:     {"value": 9, "multiplier": None,        "tolerance": None},
+    Color.GOLD_DARK: {"value": None, "multiplier": 0.1,      "tolerance": 5.0},
+    Color.GOLD_LITE: {"value": None, "multiplier": 0.1,      "tolerance": 5.0},
+}
 
 IMG_INPUT_DIR:str = "./output_resistors"
 IMG_OUTPUT_DIR:str = "./result"
@@ -87,7 +138,13 @@ JAD_AB_THRESHOLD:float = 2.3
 #SHADOW_LUMA_THRESHOLD:float = 20.0
 SHADOW_LUMA_THRESHOLD:float = 12.5
 
+BAND_FEATURE_COLS = ["band_rate", "symmetry", "log_norm", "std_l", "energy"]
+COLOR_FEATURE_COLS = ["mean_l", "mean_a", "mean_b", "mean_c", "std_l"]
+
 def main():
+    band_classifier = joblib.load("band_binary_classifier.pkl")
+    color_classifier = joblib.load("resistor_color_svm.pkl")
+
     file_count = 0
     
     save_dir = Path(IMG_OUTPUT_DIR)
@@ -122,7 +179,7 @@ def main():
         if clipped_roi is None:
             continue
 
-        print(f"clipped_roi size : {clipped_roi.shape[:2]}")
+        #print(f"clipped_roi size : {clipped_roi.shape[:2]}")
             
         h, w = clipped_roi.shape[:2]
 
@@ -148,17 +205,60 @@ def main():
 
         result_bands, debug_data = detect_bands(lab_one_line, back_ground_stats)
 
-        print("band_result start")
-        for r_b in result_bands:
-            print(r_b)
-        print("band_result finish")
+        #print("band_result start")
+        #for r_b in result_bands:
+        #    print(r_b)
+        #print("band_result finish")
 
-        correction_result_bands = refine_band_candidates(result_bands, w)
+        features = calculate_band_features(result_bands, lab_segment)
 
-        #points = [(x.x) for x in correction_result_bands]
+        valid_bands: List[DetectBand] = []
+
+        for band, feat in zip(result_bands, features):
+            # [band_rate, symmetry, log_norm, std_l, energy]
+            feature_vector = pd.DataFrame([[
+                feat.band_rate,
+                feat.symmetry,
+                feat.log_norm,
+                feat.std_l,
+                band.energy_score
+            ]], columns=BAND_FEATURE_COLS)
+            
+            # 0: Band (有効), 1: Shadow/Noise (無効)
+            prediction = band_classifier.predict(feature_vector)[0]
+            
+            if prediction == 0:
+                valid_bands.append(band)
+            else:
+                print(f"  [AI Filter] Rejected x={band.x} (Score: {band.energy_score:.1f}, Sym: {feat.symmetry:.2f})")
+
+        result_bands = valid_bands
+        
+        result_bands_with_color: List[BandColorResult] = []
+
+        color_features = extract_color_features_fixed_width(valid_bands, lab_segment)
+        
+        for band, feat in zip(valid_bands, color_features):
+            # 学習時と同じ特徴量ベクトル: [mean_l, mean_a, mean_b, mean_c, std_l]
+            color_vec = pd.DataFrame([[
+                feat.mean_l,
+                feat.mean_a,
+                feat.mean_b,
+                feat.mean_c,
+                feat.std_l
+            ]], columns=COLOR_FEATURE_COLS)
+            
+            pred_id = int(color_classifier.predict(color_vec)[0])
+            
+            result_obj = BandColorResult(x=band.x, color=Color(pred_id))
+            result_bands_with_color.append(result_obj)
+        
+        #print(result_bands_with_color)
+
+        resistor_value = read_resistor_value(result_bands_with_color, w)
+        print(f"resistor_value = {resistor_value} : {file_count}.bmp")
+
         points = [(x.x) for x in result_bands]
-        #print(f"w = {w}, h = {h}")
-        #print(f"points = {points}")
 
         l_segment_u8 = (lab_segment[:, :, 0] * (255.0 / 100.0)).astype(np.uint8)
         a_segment_u8 = (lab_segment[:, :, 1] + 128.0).astype(np.uint8)
@@ -389,11 +489,6 @@ def create_specular_mask(
             
         cv2.drawContours(mask, [cnt], -1, 255, -1)
     
-    print(f"L range: {l_float.min():.1f} - {l_float.max():.1f}")
-    print(f"Chroma range: {chroma.min():.1f} - {chroma.max():.1f} (Limit: {LAB_CHROMA_LIMIT})")
-    print(f"Z-score range: {z_score.min():.2f} - {z_score.max():.2f} (Thresh: {Z_SCORE_THRESHOLD})")
-    print(f"Sigma range: {sigma_local.min():.1f} - {sigma_local.max():.1f}")
-
     return cast(NDArray[np.uint8], mask)
 
 def select_best_segment(
@@ -516,8 +611,8 @@ def select_best_segment(
     stats_list.sort(key=lambda x: x.quality_score, reverse=True)
 
     #debug
-    for l in stats_list:
-        print(l)
+    #for l in stats_list:
+    #    print(l)
 
     return cast(NDArray[np.float32], lab_f[stats_list[0].y_top:stats_list[0].y_bottom, :]), stats_list[0].valid_pixels_ratio
 
@@ -775,7 +870,7 @@ def detect_bands(
         "peaks": peaks
     }
 
-    print(debug_data)
+    #print(debug_data)
 
     return result_bands, debug_data
     
@@ -813,100 +908,274 @@ def scan_bands_directional(
     
     return valid_chain
 
-def refine_band_candidates(
-    bands: List[DetectBand],
-    roi_width: int
-) -> List[DetectBand]:
+def calculate_band_features(
+    result_bands: List[DetectBand],
+    lab_segment: NDArray[np.float32]   # 2Dデータのみ受け取る
+) -> List[EstimateBand]:
     
-    count = len(bands)
-
+    count = len(result_bands)
     if count == 0:
         return []
+
+    # X座標でソート
+    sorted_bands = sorted(result_bands, key=lambda b: b.x)
+    x_coords = np.array([b.x for b in sorted_bands])
     
-    bands.sort(key=lambda b: b.x)
-
-    if count == 1:
-        band = bands[0]
-
-        TOLERANCE: float = 0.15
-
-        margin = roi_width * TOLERANCE
-        if abs(band.x - roi_width / 2) < margin:
-            return [band]
-        else:
-            return []
-    if count == 2:
-        return bands
-    
-    x_coords = np.array([b.x for b in bands])
-    diffs = np.diff(x_coords)
-    median_pitch = np.median(diffs)
-
-    average_width = int(np.mean([b.band_width for b in bands]))
-    most_small_width = [b for b in bands if b.band_width < average_width * 0.5]
-    if most_small_width is not []:
-        for most_small in most_small_width:
-            bands.remove(most_small)
-
-    forward_result = scan_bands_directional(bands, float(median_pitch), is_reverse=False)
-    backward_result = scan_bands_directional(bands, float(median_pitch), is_reverse=True)
-
-    if len(forward_result) >= len(backward_result):
-        refine_bands = forward_result
+    # --- 1. Pitch & Band Rate の計算 ---
+    if count > 1:
+        diffs = np.diff(x_coords)
+        pitches = []
+        for i in range(count):
+            if i == 0:
+                p = diffs[0]
+            elif i == count - 1:
+                p = diffs[-1]
+            else:
+                p = (diffs[i-1] + diffs[i]) / 2.0
+            pitches.append(float(p))
     else:
-        refine_bands = backward_result
+        # 1本しかない場合のダミーピッチ
+        pitches = [max(1.0, sorted_bands[0].band_width * 2.0)]
 
-    target_side:str = ""
-    
-    if len(refine_bands) == 3:
-        if len(refine_bands) > 1:
-            refine_band_x_coords = np.array([b.x for b in refine_bands])
+    h, w, c = lab_segment.shape
+    features_list = []
 
-            result_pitch = np.mean(np.diff(refine_band_x_coords))
-        else:
-            result_pitch = median_pitch
+    # 固定マージン設定 (左右2px -> 合計5px幅)
+    ROI_MARGIN = 2 
 
-        first_band_x = refine_bands[0].x
-        last_band_x = refine_bands[-1].x
-
-        left_margin = first_band_x
-        right_margin = roi_width - last_band_x
-
-        predicted_band = None
-
-        if left_margin > right_margin:
-            target_side = "left"
-        else:
-            target_side = "right"
+    for i, band in enumerate(sorted_bands):
+        # --- ROI座標計算 (修正箇所) ---
+        # バンド幅(band_width)は使わず、ピーク位置(x)を中心に固定幅で切り出す
+        x_center = band.x
         
-        #print(f"result pitch = {result_pitch}")
+        x_start = max(0, x_center - ROI_MARGIN)
+        x_end = min(w, x_center + ROI_MARGIN + 1) # スライスはendを含まないので +1
+        
+        # 画像端で幅が確保できない場合のガード
+        if x_end - x_start < 1:
+            features_list.append(EstimateBand(0, 0, 0, 0))
+            continue
+
+        # --- 2D ROI抽出 ---
+        roi_lab = lab_segment[:, x_start:x_end, :]
+        l_plane = roi_lab[:, :, 0]
+
+        # --- 2. std_l (輝度の標準偏差) ---
+        std_l = float(np.std(l_plane))
+
+        # --- 3. LoG (Laplacian of Gaussian) ---
+        # カーネルサイズは3 (5px幅に対して妥当)
+        ksize = 3
+        l_blur = cv2.GaussianBlur(l_plane, (ksize, ksize), 0)
+        
+        laplacian = cv2.Laplacian(l_blur, cv2.CV_32F)
+        abs_log = np.abs(laplacian)
+
+        mean_l = np.mean(l_plane)
+        if mean_l < 1.0: mean_l = 1.0
+
+        mean_abs_log = np.mean(abs_log)
+        log_norm = float(mean_abs_log / mean_l)
+
+        # --- 4. Symmetry (左右対称性) ---
+        # ROI幅が小さい(5px)ため、左右分割も厳密に行う
+        roi_w = x_end - x_start
+        center_idx = roi_w // 2
+        
+        # 中心列を除いた左右で比較するか、中心を含めて分割するか
+        # ここでは中心を含まず左右2pxずつを比較する形にする
+        left_log = abs_log[:, :center_idx]
+        right_log = abs_log[:, center_idx+1:] if roi_w % 2 != 0 else abs_log[:, center_idx:]
+        
+        if left_log.size > 0 and right_log.size > 0:
+            mean_log_left = np.mean(left_log)
+            mean_log_right = np.mean(right_log)
+            symmetry = float(np.abs(mean_log_left - mean_log_right) / (mean_l + 1e-6))
+        else:
+            symmetry = 0.0
+
+        # --- 5. Band Rate ---
+        pitch = pitches[i]
+        if pitch > 0:
+            band_rate = float(band.band_width / pitch)
+        else:
+            band_rate = 0.0
+
+        features_list.append(EstimateBand(
+            band_rate=band_rate,
+            symmetry=symmetry,
+            log_norm=log_norm,
+            std_l=std_l
+        ))
+
+    return features_list
+
+def extract_color_features_fixed_width(
+    bands: List['DetectBand'],        
+    lab_segment: NDArray[np.float32]
+) -> List[BandColor]:
     
-        if target_side == "left":
-            pred_x = int(float(first_band_x) - result_pitch)
+    h, w, c = lab_segment.shape
+    features_list = []
+    ROI_HALF_WIDTH = 2 
 
-            if pred_x > 0:
-                predicted_band = DetectBand(
-                    int(result_pitch // 2), average_width, (0,0,0), 0.0
-                )
+    for band in bands:
+        x_center = band.x
+        x_start = max(0, x_center - ROI_HALF_WIDTH)
+        x_end = min(w, x_center + ROI_HALF_WIDTH + 1)
+        
+        # 範囲外ガード
+        if x_end - x_start < 1:
+            features_list.append(BandColor(0, 0, 0, 0, 0))
+            continue
+
+        roi = lab_segment[:, x_start:x_end, :]
+        l_plane = roi[:, :, 0]
+        a_plane = roi[:, :, 1]
+        b_plane = roi[:, :, 2]
+
+        mean_l = float(np.mean(l_plane))
+        mean_a = float(np.mean(a_plane))
+        mean_b = float(np.mean(b_plane))
+        mean_c = float(np.sqrt(mean_a**2 + mean_b**2))
+        std_l = float(np.std(l_plane))
+
+        features_list.append(BandColor(
+            mean_l=mean_l,
+            mean_a=mean_a,
+            mean_b=mean_b,
+            mean_c=mean_c,
+            std_l=std_l
+        ))
+
+    return features_list
+
+def is_gold(c: Color) -> bool:
+    return c in (Color.GOLD_DARK, Color.GOLD_LITE)
+
+def calculate_4band_value(colors: List[Color]) -> Optional[str]:
+    """
+    4本のカラーリストから抵抗値を計算して文字列化する
+    [Digit1, Digit2, Multiplier, Tolerance]
+    """
+    if len(colors) != 4:
+        return None
+
+    # パラメータ取得 (キー名を value, multiplier, tolerance に変更)
+    d1 = RESISTOR_PARAMS[colors[0]]["value"]
+    d2 = RESISTOR_PARAMS[colors[1]]["value"]
+    mul_data = RESISTOR_PARAMS[colors[2]]
+    tol_data = RESISTOR_PARAMS[colors[3]]
+
+    # 数値検証
+    if d1 is None or d2 is None:
+        return None # 数値として不適な色
+    
+    multiplier = mul_data["multiplier"]
+    if multiplier is None:
+        return None # 倍率として不適な色
+
+    # 計算
+    base_val = (d1 * 10) + d2
+    resistance = base_val * multiplier
+    
+    # 許容差
+    tol = tol_data["tolerance"]
+    tol_str = f"±{tol}%" if tol is not None else "±?"
+
+    # 文字列整形 (例: 4.7 Ω, 10 kΩ)
+    if resistance >= 1_000_000:
+        val_str = f"{resistance / 1_000_000:.2f} MΩ"
+    elif resistance >= 1_000:
+        val_str = f"{resistance / 1_000:.2f} kΩ"
+    else:
+        # 4.7Ωなどの小数を表示しつつ、整数なら.0を消す
+        if float(resistance).is_integer():
+            val_str = f"{int(resistance)} Ω"
+        else:
+            val_str = f"{resistance:.1f} Ω"
+
+    return f"{val_str} {tol_str}"
+
+def read_resistor_value(color_list: List[BandColorResult], roi_width: int) -> str | None:
+    if not color_list:
+        return None
+
+    # X座標順にソートして色のリストを作成
+    sorted_bands = sorted(color_list, key=lambda b: b.x)
+    colors = [b.color for b in sorted_bands]
+    count = len(colors)
+
+    # --- 1. color_listの長さが4 ---
+    if count == 4:
+        first_is_gold = is_gold(colors[0])
+        last_is_gold = is_gold(colors[-1])
+
+        if first_is_gold:
+            # 金が先頭 -> 逆順に (逆さまに置かれている)
+            colors.reverse()
+            return calculate_4band_value(colors)
+        elif last_is_gold:
+            # 金が末尾 -> そのまま
+            return calculate_4band_value(colors)
+        else:
+            # 金が見つからないが4本ある -> 通常順と仮定
+            return calculate_4band_value(colors)
+
+    # --- 2. color_listの長さが3 かつ 金 未検出 ---
+    elif count == 3:
+        has_gold = any(is_gold(c) for c in colors)
+        
+        if not has_gold:
+            # 座標判定
+            start_gap = sorted_bands[0].x                # 左端の空き
+            end_gap = roi_width - sorted_bands[-1].x     # 右端の空き
+
+            if start_gap > end_gap:
+                # X座標 = 0に近いほう(左)で未検出
+                # 仕様: 「逆順にして末尾に金を追加」
+                colors.reverse()
+                colors.append(Color.GOLD_DARK)
+                return calculate_4band_value(colors)
             else:
-                pass
-                #print(f"fail left {pred_x}, {roi_width}, {target_side}, {left_margin}, {right_margin}")
-        elif target_side == "right":
-            pred_x = int(float(last_band_x) + result_pitch)
+                # X座標 = roi_widthに近いほう(右)で未検出
+                # 仕様: 「金を末尾に追加」
+                colors.append(Color.GOLD_DARK)
+                return calculate_4band_value(colors)
+        else:
+            # 金が含まれている3本の場合 (仕様外のためNone)
+            return None
 
-            if pred_x < roi_width:
-                predicted_band = DetectBand(
-                    int(roi_width - ((result_pitch // 3) * 2)), average_width, (0,0,0), 0.0
-                )
-            else:
-                pass
-                #print(f"fail right {pred_x}, {roi_width}")
+    # --- 3. color_listの長さが2 (4.7Ω判定) ---
+    elif count == 2:
+        c1, c2 = colors[0], colors[1]
+        
+        # 黄・紫 の組み合わせか確認 (順不同)
+        is_yellow_purple = (c1 == Color.YELLOW and c2 == Color.PURPLE)
+        is_purple_yellow = (c1 == Color.PURPLE and c2 == Color.YELLOW)
 
-        if predicted_band:
-            refine_bands.append(predicted_band)
-            refine_bands.sort(key=lambda b: b.x)
+        if is_yellow_purple or is_purple_yellow:
+            return "4.7 Ω ±5%"
+        else:
+            return None
 
-    return refine_bands
+    # --- 4. color_listの長さが1 (0Ω判定) ---
+    elif count == 1:
+        c1 = colors[0]
+        x_pos = sorted_bands[0].x
+
+        # 中心付近か判定 (幅の30%～70%の範囲内)
+        center_min = roi_width * 0.3
+        center_max = roi_width * 0.7
+        is_center = (center_min <= x_pos <= center_max)
+
+        if c1 == Color.BLACK and is_center:
+            return "0 Ω"
+        else:
+            return None
+
+    # それ以外
+    return None
 
 
 if __name__ == "__main__":
